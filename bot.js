@@ -1,14 +1,16 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
-import { initializeApp } from "firebase/app";
-import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where, serverTimestamp } from "firebase/firestore";
+import admin from 'firebase-admin'; // <--- Использование Firebase Admin SDK
+import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where, serverTimestamp } from "firebase/firestore"; // Эта строка больше не нужна для инициализации, но может использоваться для типизации
 import express from 'express';
 import cors from 'cors';
+import path from 'path'; // Для работы с путями к файлам
 
 // --- ENV CHECK ---
 console.log('--- STARTING BOT ---');
 if (!process.env.TELEGRAM_BOT_TOKEN) console.error("FATAL: TELEGRAM_BOT_TOKEN is missing!");
-if (!process.env.VITE_FIREBASE_API_KEY) console.error("FATAL: VITE_FIREBASE_API_KEY is missing!");
+// Вместо VITE_FIREBASE_API_KEY, теперь нужен путь к файлу сервисного аккаунта
+if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) console.error("FATAL: GOOGLE_APPLICATION_CREDENTIALS (path to service account key) is missing!");
 
 // --- EXPRESS SERVER (REQUIRED FOR RENDER WEB SERVICE) ---
 const app = express();
@@ -28,39 +30,55 @@ const server = app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
 });
 
-// --- FIREBASE CONFIG ---
-const firebaseConfig = {
-    apiKey: process.env.VITE_FIREBASE_API_KEY,
-    authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
-    projectId: process.env.VITE_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.VITE_FIREBASE_STORAGE_BUCKET,
-    messagingSenderId: process.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-    appId: process.env.VITE_FIREBASE_APP_ID
-};
+// --- FIREBASE CONFIG (Используем Admin SDK) ---
+// Загружаем ключ сервисного аккаунта
+// PATH TO YOUR SERVICE ACCOUNT KEY FILE
+// В продакшене, особенно на платформах вроде Render, можно указать
+// полный путь к файлу, если вы его загрузили как часть деплоя,
+// или хранить содержимое ключа как ENCODED_SERVICE_ACCOUNT_KEY в переменной окружения
+// и декодировать его. Для простоты, здесь предполагается файл `serviceAccountKey.json`
+// в корне проекта.
+const serviceAccountPath = path.resolve(process.env.GOOGLE_APPLICATION_CREDENTIALS);
 
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getFirestore(firebaseApp);
+if (!serviceAccountPath) {
+    console.error("FATAL: serviceAccountPath is not defined. Please set GOOGLE_APPLICATION_CREDENTIALS.");
+    process.exit(1);
+}
+
+let serviceAccount;
+try {
+    serviceAccount = require(serviceAccountPath);
+    console.log('Service account key loaded successfully.');
+} catch (e) {
+    console.error(`FATAL: Failed to load service account key from ${serviceAccountPath}. Error:`, e.message);
+    console.error("Please ensure GOOGLE_APPLICATION_CREDENTIALS points to a valid JSON service account key file.");
+    process.exit(1);
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+  // Для Firestore не обязательно указывать databaseURL, но для Realtime Database это нужно:
+  // databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`
+});
+
+const db = admin.firestore(); // <--- Теперь используем admin.firestore()
 
 // --- BOT CONFIG ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
-// Make sure to set WEB_APP_URL in Render env vars to your actual hosted URL
-const webAppUrl = process.env.WEB_APP_URL; 
+const webAppUrl = process.env.WEB_APP_URL;
 
 const bot = new TelegramBot(token, { polling: true });
 
 // --- LISTEN FOR NOTIFICATIONS ---
-// We listen for 'pending' status.
-const notifQuery = query(collection(db, "notification_queue"), where("status", "==", "pending"));
+const notifQuery = db.collection("notification_queue").where("status", "==", "pending"); // <--- Используем admin.firestore().collection
 
 console.log('Connecting to Firestore to listen for notifications...');
 
-// Resilient listener with automatic restart + exponential backoff for transient gRPC disconnects
 let unsubscribe = null;
 let backoff = 1000; // ms
 const MAX_BACKOFF = 60000;
 
 function startFirestoreListener() {
-  // Clear existing listener if any
   try {
     if (unsubscribe) {
       unsubscribe();
@@ -70,14 +88,11 @@ function startFirestoreListener() {
     console.warn('Error while unsubscribing previous listener:', e?.message || e);
   }
 
-  unsubscribe = onSnapshot(
-    notifQuery,
+  unsubscribe = notifQuery.onSnapshot( // <--- Используем admin.firestore() snapshot
     (snapshot) => {
-      // reset backoff on successful update
       backoff = 1000;
 
       if (snapshot.empty) {
-          // No pending notifications now.
           return;
       }
 
@@ -85,7 +100,7 @@ function startFirestoreListener() {
         if (change.type === "added") {
             const notif = change.doc.data();
             const docId = change.doc.id;
-            
+
             console.log(`[NOTIF] Processing for ID: ${notif.telegram_id}`);
 
             try {
@@ -93,17 +108,15 @@ function startFirestoreListener() {
                     parse_mode: 'HTML'
                 });
 
-                // Update status to 'sent' (use server timestamp)
-                await updateDoc(doc(db, "notification_queue", docId), {
+                await db.collection("notification_queue").doc(docId).update({ // <--- Используем admin.firestore().collection
                     status: "sent",
-                    sent_at: serverTimestamp()
+                    sent_at: admin.firestore.FieldValue.serverTimestamp() // <--- Используем admin.firestore.FieldValue.serverTimestamp()
                 });
                 console.log(`[NOTIF] Success: ${docId}`);
             } catch (error) {
                 console.error(`[NOTIF] Error sending to ${notif.telegram_id}:`, error?.message || error);
-                
-                // Mark as error so we don't retry indefinitely
-                 await updateDoc(doc(db, "notification_queue", docId), {
+
+                await db.collection("notification_queue").doc(docId).update({ // <--- Используем admin.firestore().collection
                     status: "error",
                     error_message: (error?.message || String(error))
                 });
@@ -112,17 +125,15 @@ function startFirestoreListener() {
       });
     },
     (error) => {
-      // Recognize transient gRPC "Disconnecting idle stream" and treat it as recoverable.
       const msg = error?.message || '';
       const code = error?.code ?? '';
 
-      if (msg.includes('Disconnecting idle stream') || msg.includes('Timed out waiting for new targets') || code === 1 || code === '1') {
-        console.warn('Firestore listener disconnected due to idle stream (transient). Will restart with backoff. Message:', msg);
+      if (msg.includes('Disconnecting idle stream') || msg.includes('Timed out waiting for new targets') || code === 1 || code === '1' || error instanceof admin.firestore.FirestoreError) {
+        console.warn('Firestore listener disconnected (transient or FirestoreError). Will restart with backoff. Message:', msg, 'Code:', code);
       } else {
         console.error('FIRESTORE LISTENER ERROR:', error);
       }
 
-      // Schedule restart with exponential backoff
       const delay = backoff;
       console.log(`Restarting Firestore listener in ${delay}ms`);
       setTimeout(() => {
@@ -133,7 +144,6 @@ function startFirestoreListener() {
   );
 }
 
-// start the listener
 startFirestoreListener();
 
 // --- STANDARD BOT LOGIC ---
@@ -154,7 +164,6 @@ bot.on('message', async (msg) => {
 });
 
 bot.on('polling_error', (error) => {
-  // Suppress harmless deprecation warnings if any
   if (error.code !== 'EFATAL') {
       // console.log(`[Polling Warning] ${error.code}`);
   } else {
