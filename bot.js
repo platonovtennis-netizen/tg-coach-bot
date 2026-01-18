@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { initializeApp } from "firebase/app";
-import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where } from "firebase/firestore";
+import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where, serverTimestamp } from "firebase/firestore";
 import express from 'express';
 import cors from 'cors';
 
@@ -49,50 +49,92 @@ const webAppUrl = process.env.WEB_APP_URL;
 const bot = new TelegramBot(token, { polling: true });
 
 // --- LISTEN FOR NOTIFICATIONS ---
+// We listen for 'pending' status.
+const notifQuery = query(collection(db, "notification_queue"), where("status", "==", "pending"));
+
 console.log('Connecting to Firestore to listen for notifications...');
 
-// We listen for 'pending' status.
-const q = query(collection(db, "notification_queue"), where("status", "==", "pending"));
+// Resilient listener with automatic restart + exponential backoff for transient gRPC disconnects
+let unsubscribe = null;
+let backoff = 1000; // ms
+const MAX_BACKOFF = 60000;
 
-// onSnapshot automatically handles reconnection
-const unsubscribe = onSnapshot(q, (snapshot) => {
-  if (snapshot.empty) {
-      // Useful log to see if connection is alive but just no data
-      // console.log("No pending notifications at the moment."); 
+function startFirestoreListener() {
+  // Clear existing listener if any
+  try {
+    if (unsubscribe) {
+      unsubscribe();
+      unsubscribe = null;
+    }
+  } catch (e) {
+    console.warn('Error while unsubscribing previous listener:', e?.message || e);
   }
 
-  snapshot.docChanges().forEach(async (change) => {
-    if (change.type === "added") {
-        const notif = change.doc.data();
-        const docId = change.doc.id;
-        
-        console.log(`[NOTIF] Processing for ID: ${notif.telegram_id}`);
+  unsubscribe = onSnapshot(
+    notifQuery,
+    (snapshot) => {
+      // reset backoff on successful update
+      backoff = 1000;
 
-        try {
-            await bot.sendMessage(notif.telegram_id, notif.message, {
-                parse_mode: 'HTML'
-            });
+      if (snapshot.empty) {
+          // No pending notifications now.
+          return;
+      }
 
-            // Update status to 'sent'
-            await updateDoc(doc(db, "notification_queue", docId), {
-                status: "sent",
-                sent_at: new Date()
-            });
-            console.log(`[NOTIF] Success: ${docId}`);
-        } catch (error) {
-            console.error(`[NOTIF] Error sending to ${notif.telegram_id}:`, error.message);
+      snapshot.docChanges().forEach(async (change) => {
+        if (change.type === "added") {
+            const notif = change.doc.data();
+            const docId = change.doc.id;
             
-            // Mark as error so we don't retry indefinitely
-             await updateDoc(doc(db, "notification_queue", docId), {
-                status: "error",
-                error_message: error.message
-            });
+            console.log(`[NOTIF] Processing for ID: ${notif.telegram_id}`);
+
+            try {
+                await bot.sendMessage(notif.telegram_id, notif.message, {
+                    parse_mode: 'HTML'
+                });
+
+                // Update status to 'sent' (use server timestamp)
+                await updateDoc(doc(db, "notification_queue", docId), {
+                    status: "sent",
+                    sent_at: serverTimestamp()
+                });
+                console.log(`[NOTIF] Success: ${docId}`);
+            } catch (error) {
+                console.error(`[NOTIF] Error sending to ${notif.telegram_id}:`, error?.message || error);
+                
+                // Mark as error so we don't retry indefinitely
+                 await updateDoc(doc(db, "notification_queue", docId), {
+                    status: "error",
+                    error_message: (error?.message || String(error))
+                });
+            }
         }
+      });
+    },
+    (error) => {
+      // Recognize transient gRPC "Disconnecting idle stream" and treat it as recoverable.
+      const msg = error?.message || '';
+      const code = error?.code ?? '';
+
+      if (msg.includes('Disconnecting idle stream') || msg.includes('Timed out waiting for new targets') || code === 1 || code === '1') {
+        console.warn('Firestore listener disconnected due to idle stream (transient). Will restart with backoff. Message:', msg);
+      } else {
+        console.error('FIRESTORE LISTENER ERROR:', error);
+      }
+
+      // Schedule restart with exponential backoff
+      const delay = backoff;
+      console.log(`Restarting Firestore listener in ${delay}ms`);
+      setTimeout(() => {
+        backoff = Math.min(backoff * 2, MAX_BACKOFF);
+        startFirestoreListener();
+      }, delay);
     }
-  });
-}, (error) => {
-    console.error("FATAL FIRESTORE LISTENER ERROR:", error);
-});
+  );
+}
+
+// start the listener
+startFirestoreListener();
 
 // --- STANDARD BOT LOGIC ---
 
@@ -125,5 +167,9 @@ process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down...');
     server.close();
     bot.stopPolling();
-    unsubscribe(); // Stop firestore listener
+    try {
+      if (unsubscribe) unsubscribe();
+    } catch (e) {
+      console.warn('Error during unsubscribe on shutdown:', e?.message || e);
+    }
 });
