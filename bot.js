@@ -4,6 +4,8 @@ import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where, ser
 import express from 'express';
 import cors from 'cors';
 import path from 'path'; // Для работы с путями к файлам
+import fs from 'fs/promises'; // Для чтения файлов асинхронно
+
 
 // --- ENV CHECK ---
 console.log('--- STARTING BOT ---');
@@ -46,13 +48,15 @@ if (!serviceAccountPath) {
 
 let serviceAccount;
 try {
-    serviceAccount = require(serviceAccountPath);
+    const serviceAccountJson = await fs.readFile(serviceAccountPath, 'utf8'); // Асинхронно читаем файл
+    serviceAccount = JSON.parse(serviceAccountJson); // Парсим как JSON
     console.log('Service account key loaded successfully.');
 } catch (e) {
     console.error(`FATAL: Failed to load service account key from ${serviceAccountPath}. Error:`, e.message);
     console.error("Please ensure GOOGLE_APPLICATION_CREDENTIALS points to a valid JSON service account key file.");
     process.exit(1);
 }
+
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
