@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import admin from 'firebase-admin'; // <--- Использование Firebase Admin SDK
 import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where, serverTimestamp } from "firebase/firestore"; // Эта строка больше не нужна для инициализации, но может использоваться для типизации
