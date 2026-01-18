@@ -1,30 +1,34 @@
+import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, onSnapshot, doc, updateDoc, query, where } from "firebase/firestore";
 import express from 'express';
 import cors from 'cors';
 
+// --- ENV CHECK ---
+console.log('--- STARTING BOT ---');
+if (!process.env.TELEGRAM_BOT_TOKEN) console.error("FATAL: TELEGRAM_BOT_TOKEN is missing!");
+if (!process.env.VITE_FIREBASE_API_KEY) console.error("FATAL: VITE_FIREBASE_API_KEY is missing!");
+
 // --- EXPRESS SERVER (REQUIRED FOR RENDER WEB SERVICE) ---
-// Render требует, чтобы приложение слушало порт, иначе он посчитает деплой неудачным.
 const app = express();
 app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('Tennis Coach Bot is Running!');
+    res.send('Tennis Coach Bot is Running and Healthy!');
 });
 
-// Health check endpoint (для UptimeRobot или внутренних проверок Render)
+// Health check to keep instance alive via UptimeRobot
 app.get('/health', (req, res) => {
     res.status(200).send('OK');
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
 });
 
 // --- FIREBASE CONFIG ---
-// Берем ключи из переменных окружения Render
 const firebaseConfig = {
     apiKey: process.env.VITE_FIREBASE_API_KEY,
     authDomain: process.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -34,53 +38,51 @@ const firebaseConfig = {
     appId: process.env.VITE_FIREBASE_APP_ID
 };
 
-// Проверка на наличие ключей (чтобы в логах было видно ошибку)
-if (!firebaseConfig.apiKey) {
-    console.error("ОШИБКА: Не найдены ключи Firebase в переменных окружения!");
-}
-
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp);
 
 // --- BOT CONFIG ---
 const token = process.env.TELEGRAM_BOT_TOKEN;
-const webAppUrl = process.env.WEB_APP_URL || 'https://tenniscoach-e9aa6.web.app/'; 
-
-if (!token) {
-    console.error("ОШИБКА: Не задан TELEGRAM_BOT_TOKEN!");
-    process.exit(1);
-}
+// Make sure to set WEB_APP_URL in Render env vars to your actual hosted URL
+const webAppUrl = process.env.WEB_APP_URL; 
 
 const bot = new TelegramBot(token, { polling: true });
 
 // --- LISTEN FOR NOTIFICATIONS ---
-console.log('Подключение к Firestore для уведомлений...');
+console.log('Connecting to Firestore to listen for notifications...');
 
-// Слушаем только уведомления со статусом 'pending'
+// We listen for 'pending' status.
 const q = query(collection(db, "notification_queue"), where("status", "==", "pending"));
 
+// onSnapshot automatically handles reconnection
 const unsubscribe = onSnapshot(q, (snapshot) => {
+  if (snapshot.empty) {
+      // Useful log to see if connection is alive but just no data
+      // console.log("No pending notifications at the moment."); 
+  }
+
   snapshot.docChanges().forEach(async (change) => {
     if (change.type === "added") {
         const notif = change.doc.data();
         const docId = change.doc.id;
         
-        console.log(`Новое уведомление для ${notif.telegram_id}: ${notif.message}`);
+        console.log(`[NOTIF] Processing for ID: ${notif.telegram_id}`);
 
         try {
             await bot.sendMessage(notif.telegram_id, notif.message, {
                 parse_mode: 'HTML'
             });
 
-            // Обновляем статус на 'sent'
+            // Update status to 'sent'
             await updateDoc(doc(db, "notification_queue", docId), {
                 status: "sent",
                 sent_at: new Date()
             });
-            console.log(`Уведомление ${docId} отправлено.`);
+            console.log(`[NOTIF] Success: ${docId}`);
         } catch (error) {
-            console.error(`Ошибка отправки сообщения пользователю ${notif.telegram_id}:`, error.message);
-            // Помечаем как ошибку
+            console.error(`[NOTIF] Error sending to ${notif.telegram_id}:`, error.message);
+            
+            // Mark as error so we don't retry indefinitely
              await updateDoc(doc(db, "notification_queue", docId), {
                 status: "error",
                 error_message: error.message
@@ -89,7 +91,7 @@ const unsubscribe = onSnapshot(q, (snapshot) => {
     }
   });
 }, (error) => {
-    console.error("Firestore listen error:", error);
+    console.error("FATAL FIRESTORE LISTENER ERROR:", error);
 });
 
 // --- STANDARD BOT LOGIC ---
@@ -98,12 +100,11 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  // Обработка команды /start
   if (text === '/start') {
-    await bot.sendMessage(chatId, 'Привет! Нажми кнопку ниже, чтобы записаться на тренировку:', {
+    await bot.sendMessage(chatId, 'Привет! Нажми кнопку ниже, чтобы открыть приложение:', {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🎾 Записаться", web_app: { url: webAppUrl } }]
+          [{ text: "🎾 Открыть приложение", web_app: { url: webAppUrl } }]
         ]
       }
     });
@@ -111,11 +112,18 @@ bot.on('message', async (msg) => {
 });
 
 bot.on('polling_error', (error) => {
+  // Suppress harmless deprecation warnings if any
   if (error.code !== 'EFATAL') {
-      console.log(`[Polling Warning] ${error.code}: ${error.message}`);
+      // console.log(`[Polling Warning] ${error.code}`);
   } else {
-      console.error(`[Polling Error] ${error.code}: ${error.message}`);
+      console.error(`[Polling Error] ${error.message}`);
   }
 });
 
-console.log('Бот запущен и слушает очередь уведомлений...');
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down...');
+    server.close();
+    bot.stopPolling();
+    unsubscribe(); // Stop firestore listener
+});
