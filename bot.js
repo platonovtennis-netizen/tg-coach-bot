@@ -1,4 +1,3 @@
-import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import admin from 'firebase-admin'; 
 import { getFirestore } from "firebase-admin/firestore";
